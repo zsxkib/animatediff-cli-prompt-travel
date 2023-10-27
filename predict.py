@@ -3,8 +3,10 @@
 
 import os
 import re
+import shutil
 import subprocess
-from cog import BasePredictor, Input, Path
+from cog import BasePredictor, Input
+from cog import Path as CogPath
 
 FAKE_PROMPT_TRAVEL_JSON = """
 {{
@@ -28,6 +30,29 @@ FAKE_PROMPT_TRAVEL_JSON = """
   "n_prompt": [
     "{negative_prompt}"
   ],
+  "controlnet_map": {{
+    "input_image_dir": "controlnet_image/test",
+    "max_samples_on_vram": 200,
+    "max_models_on_vram": 3,
+    "save_detectmap": true,
+    "preprocess_on_gpu": true,
+    "is_loop": {loop},
+    "qr_code_monster_v2": {{
+      "enable": {enable_qr_code_monster_v2},
+      "use_preprocessor": {qr_code_monster_v2_preprocessor},
+      "guess_mode": {qr_code_monster_v2_guess_mode},
+      "controlnet_conditioning_scale": {controlnet_conditioning_scale},
+      "control_guidance_start": 0.0,
+      "control_guidance_end": 1.0,
+      "control_scale_list": [
+        0.5,
+        0.4,
+        0.3,
+        0.2,
+        0.1
+      ]
+    }}
+  }},
   "output":{{
     "format" : "{output_format}",
     "fps" : {playback_frames_per_second},
@@ -51,11 +76,12 @@ class Predictor(BasePredictor):
                 "Invalid URL. Only downloads from 'https://civitai.com/api/download/models/' are allowed."
             )
 
-        cmd = ["pget", custom_base_model_url, "data/share/Stable-diffusion/custom.safetensors"]
+        # cmd = ["pget", custom_base_model_url, "data/share/Stable-diffusion/custom.safetensors"]
+        cmd = ["wget", "-O", "data/share/Stable-diffusion/custom.safetensors", custom_base_model_url]
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout_output, stderr_output = process.communicate()
 
-        print("Output from wget command:")
+        print("Output from pget command:")
         print(stdout_output)
         if stderr_output:
             print("Errors from wget command:")
@@ -96,6 +122,30 @@ class Predictor(BasePredictor):
 
     def predict(
         self,
+        controlnet_video: CogPath = Input(
+            description="A short video/gif that will be used as the keyframes for QR Code Monster to use, Please note, all of the frames will be used as keyframes",
+            default=None,
+        ),
+        enable_qr_code_monster_v2: bool = Input(
+            description="Flag to enable QR Code Monster V2 ControlNet",
+            default=True,
+        ),
+        qr_code_monster_v2_preprocessor: bool = Input(
+            description="Flag to pre-process keyframes for QR Code Monster V2 ControlNet",
+            default=True,
+        ),
+        qr_code_monster_v2_guess_mode: bool = Input(
+            description="Flag to enable guess mode (un-guided) for QR Code Monster V2 ControlNet",
+            default=False,
+        ),
+        controlnet_conditioning_scale: float = Input(
+            description="Strength of ControlNet. The outputs of the ControlNet are multiplied by `controlnet_conditioning_scale` before they are added to the residual in the original UNet",
+            default=0.18,
+        ),
+        loop: bool = Input(
+            description="Flag to loop the video. Use when you have an 'infinitely' repeating video/gif ControlNet video",
+            default=True,
+        ),
         head_prompt: str = Input(
             description="Primary animation prompt. If a prompt map is provided, this will be prefixed at the start of every individual prompt in the map",
             default="masterpiece, best quality, a haunting and detailed depiction of a ship at sea, battered by waves, ominous,((dark clouds:1.3)),distant lightning, rough seas, rain, silhouette of the ship against the stormy sky",
@@ -133,7 +183,7 @@ class Predictor(BasePredictor):
             description="Choose the base model for animation generation. If 'CUSTOM' is selected, provide a custom model URL in the next parameter",
             default="majicmixRealistic_v5Preview",
             choices=[
-                "realisticVisionV20_v20",
+                "realisticVisionV40_v20Novae",
                 "lyriel_v16",
                 "majicmixRealistic_v5Preview",
                 "rcnzCartoon3d_v10",
@@ -209,11 +259,26 @@ class Predictor(BasePredictor):
             description="Seed for different images and reproducibility. Use -1 to randomise seed",
             default=-1,
         ),
-    ) -> Path:
+    ) -> CogPath:
         """
-        Run a single prediction on the model
-        NOTE: lora_map, motion_lora_map, and controlnets are NOT supported (cut scope)
+        Animate Diff Prompt Walking CLI w/ QR Monster ControlNet
+        NOTE: lora_map, motion_lora_map are NOT supported
         """
+
+        if controlnet_video:
+            print("Using ControlNet")
+            path_to_controlnet_video = str(controlnet_video)
+            output_dir = "data/controlnet_image/test/qr_code_monster_v2"
+            if os.path.exists(output_dir):  # Empty out the output directory
+                shutil.rmtree(output_dir)
+            os.makedirs(output_dir)
+            output_pattern = os.path.join(output_dir, "%04d.png")
+
+            # Run the ffmpeg command to extract frames
+            subprocess.run(
+                ["ffmpeg", "-i", path_to_controlnet_video, "-vframes", str(frames), output_pattern], check=True
+            )
+
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
@@ -234,6 +299,11 @@ class Predictor(BasePredictor):
             prompt_map=self.transform_prompt_map(prompt_map),
             scheduler=scheduler,
             clip_skip=clip_skip,
+            enable_qr_code_monster_v2="true" if enable_qr_code_monster_v2 else "false",
+            qr_code_monster_v2_preprocessor="true" if qr_code_monster_v2_preprocessor else "false",
+            qr_code_monster_v2_guess_mode="true" if qr_code_monster_v2_guess_mode else "false",
+            controlnet_conditioning_scale=controlnet_conditioning_scale,
+            loop="true" if loop else "false",
         )
 
         print(f"{'-'*80}")
@@ -294,4 +364,4 @@ class Predictor(BasePredictor):
         media_path = os.path.join(recent_dir, media_files[0])
         print(f"Identified Media Path: {media_path}")
 
-        return Path(media_path)
+        return CogPath(media_path)
