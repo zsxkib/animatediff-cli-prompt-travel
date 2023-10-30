@@ -5,8 +5,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from cog import BasePredictor, Input
 from cog import Path as CogPath
+
+sys.path.append("/frame-interpolation")
+from eval import interpolator as film_interpolator, util as film_util
+
 
 FAKE_PROMPT_TRAVEL_JSON = """
 {{
@@ -67,7 +72,12 @@ FAKE_PROMPT_TRAVEL_JSON = """
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
-        pass
+        print("Loading interpolator...")
+        self.interpolator = film_interpolator.Interpolator(
+            # from https://drive.google.com/drive/folders/1i9Go1YI2qiFWeT5QtywNFmYAA74bhXWj?usp=sharing
+            "/src/frame_interpolation_saved_model",
+            None,
+        )
 
     def download_custom_model(self, custom_base_model_url: str):
         # Validate the custom_base_model_url to ensure it's from "civitai.com"
@@ -255,15 +265,27 @@ class Predictor(BasePredictor):
             choices=["mp4", "gif"],
         ),
         playback_frames_per_second: int = Input(default=8, ge=1, le=60),
+        film_interpolation: bool = Input(
+            description="Whether to use FILM for between-frame interpolation (film-net.github.io)",
+            default=True,
+        ),
+        num_interpolation_steps: int = Input(
+            description="Number of steps to interpolate between animation frames",
+            default=5,
+            ge=1,
+            le=50,
+        ),
         seed: int = Input(
-            description="Seed for different images and reproducibility. Use -1 to randomise seed",
-            default=-1,
+            description="Seed for different images and reproducibility. Leave blank to randomise seed",
+            default=None,
         ),
     ) -> CogPath:
         """
         Animate Diff Prompt Walking CLI w/ QR Monster ControlNet
         NOTE: lora_map, motion_lora_map are NOT supported
         """
+        if seed is None or seed < 0:
+            seed = -1
 
         if controlnet_video:
             print("Using ControlNet")
