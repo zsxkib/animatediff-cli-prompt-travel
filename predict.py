@@ -1,13 +1,20 @@
 # Prediction interface for Cog ⚙️
 # https://github.com/replicate/cog/blob/main/docs/python.md
 
+import glob
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
-import sys
+
 from cog import BasePredictor, Input
 from cog import Path as CogPath
+
+import sys
+import gdown
+import torch
+import tensorflow as tf
 
 sys.path.append("/frame-interpolation")
 from eval import interpolator as film_interpolator, util as film_util
@@ -72,7 +79,20 @@ FAKE_PROMPT_TRAVEL_JSON = """
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
+
         print("Loading interpolator...")
+        gpus = tf.config.experimental.list_physical_devices("GPU")
+        if gpus:
+            try:
+                # Currently, memory growth needs to be the same across GPUs
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                logical_gpus = tf.config.experimental.list_logical_devices("GPU")
+                print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+            except RuntimeError as e:
+                # Memory growth must be set before GPUs have been initialized
+                print(e)
+
         self.interpolator = film_interpolator.Interpolator(
             # from https://drive.google.com/drive/folders/1i9Go1YI2qiFWeT5QtywNFmYAA74bhXWj?usp=sharing
             "/src/frame_interpolation_saved_model",
@@ -129,6 +149,36 @@ class Predictor(BasePredictor):
             formatted_segments.append(formatted_segment)
 
         return ", ".join(formatted_segments)
+
+    def find_recent_directory(self, base_path):
+        return max(
+            (
+                os.path.join(base_path, d)
+                for d in os.listdir(base_path)
+                if os.path.isdir(os.path.join(base_path, d))
+            ),
+            key=os.path.getmtime,
+        )
+
+    def find_media_file(self, directory, extensions):
+        media_files = [f for f in os.listdir(directory) if f.endswith(extensions)]
+        if not media_files:
+            raise ValueError(f"No media files with extensions {extensions} found in directory: {directory}")
+        return os.path.join(directory, media_files[0])
+
+    def find_png_folder(self, directory, exclude_folder):
+        contents = os.listdir(directory)
+        png_folder = next(
+            (
+                item
+                for item in contents
+                if item != exclude_folder and os.path.isdir(os.path.join(directory, item))
+            ),
+            None,
+        )
+        if png_folder is None:
+            raise ValueError(f"No PNG folder found in directory: {directory}")
+        return os.path.join(directory, png_folder)
 
     def predict(
         self,
@@ -271,7 +321,7 @@ class Predictor(BasePredictor):
         ),
         num_interpolation_steps: int = Input(
             description="Number of steps to interpolate between animation frames",
-            default=5,
+            default=3,
             ge=1,
             le=50,
         ),
@@ -339,6 +389,7 @@ class Predictor(BasePredictor):
         with open(file_path, "w") as file:
             file.write(prompt_travel_json)
 
+        torch.cuda.empty_cache()
         cmd = [
             "animatediff",
             "generate",
@@ -368,22 +419,69 @@ class Predictor(BasePredictor):
             raise ValueError(f"Command exited with code: {process.returncode}")
 
         print("Identifying the GIF path from the generated outputs...")
-        recent_dir = max(
-            (
-                os.path.join("output", d)
-                for d in os.listdir("output")
-                if os.path.isdir(os.path.join("output", d))
-            ),
-            key=os.path.getmtime,
-        )
+        output_base_path = "output"
+        recent_dir = self.find_recent_directory(output_base_path)
+        media_path = self.find_media_file(recent_dir, (".gif", ".mp4"))
+        png_folder_path = self.find_png_folder(recent_dir, "00_detectmap")
 
+        # Print the identified paths
         print(f"Identified directory: {recent_dir}")
-        media_files = [f for f in os.listdir(recent_dir) if f.endswith((".gif", ".mp4"))]
-
-        if not media_files:
-            raise ValueError(f"No GIF or MP4 files found in directory: {recent_dir}")
-
-        media_path = os.path.join(recent_dir, media_files[0])
         print(f"Identified Media Path: {media_path}")
+        print(f"Identified PNG Folder Path: {png_folder_path}")
 
-        return CogPath(media_path)
+        # List of original frame filenames
+        original_frame_filenames = sorted(glob.glob(os.path.join(png_folder_path, "*.png")))
+
+        # Attempt to interpolate frames if required
+        interpolated_frames = None
+        if film_interpolation:
+            try:
+                print("Interpolating frames with FILM...")
+                # You need to create and provide an instance of the FILM interpolator here
+                # Use the interpolate_recursively_from_files function
+                interpolated_frames = film_util.interpolate_recursively_from_files(
+                    original_frame_filenames, num_interpolation_steps, self.interpolator
+                )
+                # Convert generator to list
+                interpolated_frames = list(interpolated_frames)
+            except Exception as e:
+                print(f"Interpolation failed with error: {e}")
+                print("Falling back to non-interpolated frames.")
+                interpolated_frames = None
+
+        # If no interpolation was done (either not required or it failed), read the images into memory
+        if interpolated_frames is None:
+            interpolated_frames = [film_util.read_image(filename) for filename in original_frame_filenames]
+
+        # Save frames to a new directory
+        interpolated_frames_dir = Path(recent_dir) / "interpolated_frames"
+        interpolated_frames_dir.mkdir(parents=True, exist_ok=True)
+        for i, frame in enumerate(interpolated_frames):
+            frame_filename = interpolated_frames_dir / f"{i:08d}.png"
+            film_util.write_image(str(frame_filename), frame)
+
+        # Use the new directory with interpolated frames for the ffmpeg input
+        input_pattern = str(interpolated_frames_dir / "%08d.png")
+        output_video = str(Path(recent_dir) / "output_video.mp4")
+        ffmpeg_command = [
+            "ffmpeg",
+            "-r",
+            str(
+                playback_frames_per_second
+            ),  # You may need to adjust this if the interpolation changes the desired playback speed
+            "-i",
+            input_pattern,
+            "-vcodec",
+            "libx264",
+            "-crf",
+            "1",  # High quality CRF value
+            "-pix_fmt",
+            "yuv420p",
+            output_video,
+        ]
+
+        # Execute the ffmpeg command
+        subprocess.run(ffmpeg_command, check=True)
+
+        # Return the path to the new video
+        return CogPath(output_video)

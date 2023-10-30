@@ -245,3 +245,4 @@ output.gif
 output.mp4
 nb.ipynb
 .cog/
+frame_interpolation_saved_model/
