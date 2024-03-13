@@ -1,6 +1,5 @@
 import json
 import logging
-from functools import lru_cache
 from os import PathLike
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
@@ -85,11 +84,15 @@ class InferenceConfig(BaseSettings):
         json_config_path: Path
 
 
-@lru_cache(maxsize=2)
 def get_infer_config(
     is_v2:bool,
+    is_sdxl:bool,
 ) -> InferenceConfig:
     config_path: Path = get_dir("config").joinpath("inference/default.json" if not is_v2 else "inference/motion_v2.json")
+
+    if is_sdxl:
+        config_path = get_dir("config").joinpath("inference/motion_sdxl.json")
+
     settings = InferenceConfig(json_config_path=config_path)
     return settings
 
@@ -99,12 +102,16 @@ class ModelConfig(BaseSettings):
     path: Path = Field(...)  # Path to the model
     vae_path: str = ""  # Path to the model
     motion_module: Path = Field(...)  # Path to the motion module
+    context_schedule: str = "uniform"
+    lcm_map: Dict[str,Any]= Field({})
+    gradual_latent_hires_fix_map: Dict[str,Any]= Field({})
     compile: bool = Field(False)  # whether to compile the model with TorchDynamo
     tensor_interpolation_slerp: bool = Field(True)
     seed: list[int] = Field([])  # Seed(s) for the random number generators
     scheduler: DiffusionScheduler = Field(DiffusionScheduler.k_dpmpp_2m)  # Scheduler to use
     steps: int = 25  # Number of inference steps to run
     guidance_scale: float = 7.5  # CFG scale to use
+    unet_batch_size: int = 1
     clip_skip: int = 1  # skip the last N-1 layers of the CLIP text encoder
     prompt_fixed_ratio: float = 0.5
     head_prompt: str = ""
@@ -112,9 +119,11 @@ class ModelConfig(BaseSettings):
     tail_prompt: str = ""
     n_prompt: list[str] = Field([])  # Anti-prompt(s) to use
     is_single_prompt_mode : bool = Field(False)
-    lora_map: Dict[str,float]= Field({})
+    lora_map: Dict[str,Any]= Field({})
     motion_lora_map: Dict[str,float]= Field({})
     ip_adapter_map: Dict[str,Any]= Field({})
+    img2img_map: Dict[str,Any]= Field({})
+    region_map: Dict[str,Any]= Field({})
     controlnet_map: Dict[str,Any]= Field({})
     upscale_config: Dict[str,Any]= Field({})
     stylize_config: Dict[str,Any]= Field({})
@@ -129,7 +138,6 @@ class ModelConfig(BaseSettings):
         return f"{self.name.lower()}-{self.path.stem.lower()}"
 
 
-@lru_cache(maxsize=2)
 def get_model_config(config_path: Path) -> ModelConfig:
     settings = ModelConfig(json_config_path=config_path)
     return settings

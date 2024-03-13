@@ -3,7 +3,8 @@ from typing import Optional
 
 import torch
 import torch._dynamo as dynamo
-from diffusers import StableDiffusionPipeline
+from diffusers import (DiffusionPipeline, StableDiffusionPipeline,
+                       StableDiffusionXLPipeline)
 from einops._torch_specific import allow_ops_in_compiled_graph
 
 from animatediff.utils.device import get_memory_format, get_model_dtypes
@@ -13,27 +14,23 @@ logger = logging.getLogger(__name__)
 
 
 def send_to_device(
-    pipeline: StableDiffusionPipeline,
+    pipeline: DiffusionPipeline,
     device: torch.device,
     freeze: bool = True,
     force_half: bool = False,
     compile: bool = False,
-) -> StableDiffusionPipeline:
+    is_sdxl: bool = False,
+) -> DiffusionPipeline:
+    if is_sdxl:
+        return send_to_device_sdxl(
+            pipeline=pipeline,
+            device=device,
+            freeze=freeze,
+            force_half=force_half,
+            compile=compile,
+        )
+
     logger.info(f"Sending pipeline to device \"{device.type}{device.index if device.index else ''}\"")
-
-    # Freeze model weights and force-disable training
-    if freeze or compile:
-#        pipeline.freeze()
-        pipeline.vae.requires_grad_(False)
-        pipeline.unet.requires_grad_(False)
-        pipeline.text_encoder.requires_grad_(False)
-        pipeline.unet.eval()
-        pipeline.vae.eval()
-        pipeline.text_encoder.eval()
-
-        pipeline.unet.train = nop_train
-        pipeline.vae.train = nop_train
-        pipeline.text_encoder.train = nop_train
 
     unet_dtype, tenc_dtype, vae_dtype = get_model_dtypes(device, force_half)
     model_memory_format = get_memory_format(device)
@@ -56,6 +53,13 @@ def send_to_device(
                 #pipeline.controlnet_map[c] = pipeline.controlnet_map[c].to(device=device, dtype=unet_dtype, memory_format=model_memory_format)
                 pipeline.controlnet_map[c] = pipeline.controlnet_map[c].to(dtype=unet_dtype, memory_format=model_memory_format)
 
+    if hasattr(pipeline, 'lora_map'):
+        if pipeline.lora_map:
+            pipeline.lora_map.to(device=device, dtype=unet_dtype)
+
+    if hasattr(pipeline, 'lcm'):
+        if pipeline.lcm:
+            pipeline.lcm.to(device=device, dtype=unet_dtype)
 
     pipeline.unet = pipeline.unet.to(device=device, dtype=unet_dtype, memory_format=model_memory_format)
     pipeline.text_encoder = pipeline.text_encoder.to(device=device, dtype=tenc_dtype)
@@ -76,6 +80,32 @@ def send_to_device(
             logger.debug("Skipping model compilation, already compiled!")
 
     return pipeline
+
+
+def send_to_device_sdxl(
+    pipeline: StableDiffusionXLPipeline,
+    device: torch.device,
+    freeze: bool = True,
+    force_half: bool = False,
+    compile: bool = False,
+) -> StableDiffusionXLPipeline:
+    logger.info(f"Sending pipeline to device \"{device.type}{device.index if device.index else ''}\"")
+
+    pipeline.unet = pipeline.unet.half()
+    pipeline.text_encoder = pipeline.text_encoder.half()
+    pipeline.text_encoder_2 = pipeline.text_encoder_2.half()
+
+    if False:
+        pipeline.to(device)
+    else:
+        pipeline.enable_model_cpu_offload()
+
+    pipeline.enable_xformers_memory_efficient_attention()
+    pipeline.enable_vae_slicing()
+    pipeline.enable_vae_tiling()
+
+    return pipeline
+
 
 
 def get_context_params(

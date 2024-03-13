@@ -8,36 +8,38 @@ from safetensors.torch import load_file
 from torch import Tensor
 
 from animatediff import get_dir
-from animatediff.pipelines.animation import AnimationPipeline
 
 EMBED_DIR = get_dir("data").joinpath("embeddings")
+EMBED_DIR_SDXL = get_dir("data").joinpath("sdxl_embeddings")
 EMBED_EXTS = [".pt", ".pth", ".bin", ".safetensors"]
 
 logger = logging.getLogger(__name__)
 
 
-def scan_text_embeddings() -> list[Path]:
-    return [x for x in EMBED_DIR.rglob("**/*") if x.is_file() and x.suffix.lower() in EMBED_EXTS]
+def scan_text_embeddings(is_sdxl=False) -> list[Path]:
+    embed_dir=EMBED_DIR_SDXL if is_sdxl else EMBED_DIR
+    return [x for x in embed_dir.rglob("**/*") if x.is_file() and x.suffix.lower() in EMBED_EXTS]
 
 
-def get_text_embeddings(return_tensors: bool = True) -> dict[str, Union[Tensor, Path]]:
+def get_text_embeddings(return_tensors: bool = True, is_sdxl:bool = False) -> dict[str, Union[Tensor, Path]]:
+    embed_dir=EMBED_DIR_SDXL if is_sdxl else EMBED_DIR
     embeds = {}
     skipped = {}
     path: Path
-    for path in scan_text_embeddings():
+    for path in scan_text_embeddings(is_sdxl):
         if path.stem not in embeds:
             # new token/name, add it
-            logger.debug(f"Found embedding token {path.stem} at {path.relative_to(EMBED_DIR)}")
+            logger.debug(f"Found embedding token {path.stem} at {path.relative_to(embed_dir)}")
             embeds[path.stem] = path
         else:
             # duplicate token/name, skip it
             skipped[path.stem] = path
-            logger.debug(f"Duplicate embedding token {path.stem} at {path.relative_to(EMBED_DIR)}")
+            logger.debug(f"Duplicate embedding token {path.stem} at {path.relative_to(embed_dir)}")
 
     # warn the user if there are duplicates we skipped
     if skipped:
         logger.warn(f"Skipped {len(skipped)} embeddings with duplicate tokens!")
-        logger.warn(f"Skipped paths: {[x.relative_to(EMBED_DIR) for x in skipped.values()]}")
+        logger.warn(f"Skipped paths: {[x.relative_to(embed_dir) for x in skipped.values()]}")
         logger.warn("Rename these files to avoid collisions!")
 
     # we can optionally return the tensors instead of the paths
@@ -94,10 +96,10 @@ def load_embed_weights(path: Path, key: Optional[str] = None) -> Optional[Tensor
 
 
 def load_text_embeddings(
-    pipeline: DiffusionPipeline, text_embeds: Optional[tuple[str, torch.Tensor]] = None
+    pipeline: DiffusionPipeline, text_embeds: Optional[tuple[str, torch.Tensor]] = None, is_sdxl = False
 ) -> None:
     if text_embeds is None:
-        text_embeds = get_text_embeddings()
+        text_embeds = get_text_embeddings(False, is_sdxl)
     if len(text_embeds) < 1:
         logger.info("No TI embeddings found")
         return
@@ -105,19 +107,46 @@ def load_text_embeddings(
     logger.info(f"Loading {len(text_embeds)} TI embeddings...")
     loaded, skipped, failed = [], [], []
 
-    vocab = pipeline.tokenizer.get_vocab()  # get the tokenizer vocab so we can skip loaded embeddings
-    for token, embed in text_embeds.items():
-        try:
-            if token not in vocab:
-                pipeline.load_textual_inversion({token: embed})
-                logger.debug(f"Loaded embedding '{token}'")
-                loaded.append(token)
-            else:
-                logger.debug(f"Skipping embedding '{token}' (already loaded)")
-                skipped.append(token)
-        except Exception:
-            logger.error(f"Failed to load TI embedding: {token}", exc_info=True)
-            failed.append(token)
+    if True:
+        vocab = pipeline.tokenizer.get_vocab()  # get the tokenizer vocab so we can skip loaded embeddings
+        for token, emb_path in text_embeds.items():
+            try:
+                if token not in vocab:
+                    if is_sdxl:
+                        embed = load_embed_weights(emb_path, "clip_g").to(pipeline.text_encoder_2.device)
+                        pipeline.load_textual_inversion(embed, token=token, text_encoder=pipeline.text_encoder_2, tokenizer=pipeline.tokenizer_2)
+                        embed = load_embed_weights(emb_path, "clip_l").to(pipeline.text_encoder.device)
+                        pipeline.load_textual_inversion(embed, token=token, text_encoder=pipeline.text_encoder, tokenizer=pipeline.tokenizer)
+                    else:
+                        embed = load_embed_weights(emb_path).to(pipeline.text_encoder.device)
+                        pipeline.load_textual_inversion({token: embed})
+                    logger.debug(f"Loaded embedding '{token}'")
+                    loaded.append(token)
+                else:
+                    logger.debug(f"Skipping embedding '{token}' (already loaded)")
+                    skipped.append(token)
+            except Exception:
+                logger.error(f"Failed to load TI embedding: {token}", exc_info=True)
+                failed.append(token)
+
+    else:
+        vocab = pipeline.tokenizer.get_vocab()  # get the tokenizer vocab so we can skip loaded embeddings
+        for token, embed in text_embeds.items():
+            try:
+                if token not in vocab:
+                    if is_sdxl:
+                        pipeline.load_textual_inversion(text_encoder_sd, token=token, text_encoder=pipe.text_encoder, tokenizer=pipe.tokenizer)
+                    else:
+                        pipeline.load_textual_inversion({token: embed})
+                    logger.debug(f"Loaded embedding '{token}'")
+                    loaded.append(token)
+                else:
+                    logger.debug(f"Skipping embedding '{token}' (already loaded)")
+                    skipped.append(token)
+            except Exception:
+                logger.error(f"Failed to load TI embedding: {token}", exc_info=True)
+                failed.append(token)
+
     # Print a summary of what we loaded
     logger.info(f"Loaded {len(loaded)} embeddings, {len(skipped)} existing, {len(failed)} failed")
     logger.info(f"Available embeddings: {', '.join(loaded + skipped)}")

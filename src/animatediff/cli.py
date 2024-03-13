@@ -5,18 +5,38 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Optional
 
+if False:
+    if 'PYTORCH_CUDA_ALLOC_CONF' in os.environ:
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ",backend:cudaMallocAsync"
+    else:
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = "backend:cudaMallocAsync"
+
+    #"garbage_collection_threshold:0.6"
+    # max_split_size_mb:1024"
+    # "backend:cudaMallocAsync"
+    # roundup_power2_divisions:4
+    print(f"{os.environ['PYTORCH_CUDA_ALLOC_CONF']=}")
+
+if False:
+    os.environ['PYTORCH_NO_CUDA_MEMORY_CACHING']="1"
+
+
 import torch
 import typer
+from diffusers import DiffusionPipeline
 from diffusers.utils.logging import \
     set_verbosity_error as set_diffusers_verbosity_error
 from rich.logging import RichHandler
 
 from animatediff import __version__, console, get_dir
 from animatediff.generate import (controlnet_preprocess, create_pipeline,
-                                  create_us_pipeline, ip_adapter_preprocess,
-                                  load_controlnet_models, run_inference,
+                                  create_us_pipeline, img2img_preprocess,
+                                  ip_adapter_preprocess,
+                                  load_controlnet_models, prompt_preprocess,
+                                  region_preprocess, run_inference,
                                   run_upscale, save_output,
-                                  unload_controlnet_models)
+                                  unload_controlnet_models,
+                                  wild_card_conversion)
 from animatediff.pipelines import AnimationPipeline, load_text_embeddings
 from animatediff.settings import (CKPT_EXTENSIONS, InferenceConfig,
                                   ModelConfig, get_infer_config,
@@ -25,10 +45,10 @@ from animatediff.utils.civitai2config import generate_config_from_civitai_info
 from animatediff.utils.model import (checkpoint_to_pipeline,
                                      fix_checkpoint_if_needed, get_base_model)
 from animatediff.utils.pipeline import get_context_params, send_to_device
-from animatediff.utils.util import (extract_frames, is_v2_motion_module,
-                                    path_from_cwd, save_frames, save_imgs,
-                                    save_video,
-                                    set_tensor_interpolation_method)
+from animatediff.utils.util import (extract_frames, is_sdxl_checkpoint,
+                                    is_v2_motion_module, path_from_cwd,
+                                    save_frames, save_imgs, save_video,
+                                    set_tensor_interpolation_method, show_gpu)
 from animatediff.utils.wild_card import replace_wild_card
 
 cli: typer.Typer = typer.Typer(
@@ -71,6 +91,19 @@ else:
 logger = logging.getLogger(__name__)
 
 
+from importlib.metadata import version as meta_version
+
+from packaging import version
+
+diffuser_ver = meta_version('diffusers')
+
+logger.info(f"{diffuser_ver=}")
+
+if version.parse(diffuser_ver) < version.parse('0.23.0'):
+    logger.error(f"The version of diffusers is out of date")
+    logger.error(f"python -m pip install diffusers==0.23.0")
+    raise ImportError("Please update diffusers to 0.23.0")
+
 try:
     from animatediff.rife import app as rife_app
 
@@ -88,7 +121,7 @@ cli.add_typer(stylize, name="stylize")
 
 
 # mildly cursed globals to allow for reuse of the pipeline if we're being called as a module
-g_pipeline: Optional[AnimationPipeline] = None
+g_pipeline: Optional[DiffusionPipeline] = None
 last_model_path: Optional[Path] = None
 
 
@@ -106,16 +139,6 @@ def get_random():
 
 @cli.command()
 def generate(
-    model_name_or_path: Annotated[
-        Path,
-        typer.Option(
-            ...,
-            "--model-path",
-            "-m",
-            path_type=Path,
-            help="Base model to use (path or HF repo ID). You probably don't need to change this.",
-        ),
-    ] = Path("runwayml/stable-diffusion-v1-5"),
     config_path: Annotated[
         Path,
         typer.Option(
@@ -168,17 +191,17 @@ def generate(
             "-C",
             min=1,
             max=32,
-            help="Number of frames to condition on (default: max of <length> or 32). max for motion module v1 is 24",
+            help="Number of frames to condition on (default: 16)",
             show_default=False,
             rich_help_panel="Generation",
         ),
-    ] = None,
+    ] = 16,
     overlap: Annotated[
         Optional[int],
         typer.Option(
             "--overlap",
             "-O",
-            min=1,
+            min=0,
             max=12,
             help="Number of frames to overlap in context (default: context//4)",
             show_default=False,
@@ -284,27 +307,38 @@ def generate(
     # be quiet, diffusers. we care not for your safety checker
     set_diffusers_verbosity_error()
 
+    #torch.set_flush_denormal(True)
+
     config_path = config_path.absolute()
     logger.info(f"Using generation config: {path_from_cwd(config_path)}")
     model_config: ModelConfig = get_model_config(config_path)
-    is_v2 = is_v2_motion_module(data_dir.joinpath(model_config.motion_module))
-    infer_config: InferenceConfig = get_infer_config(is_v2)
+
+    is_sdxl = is_sdxl_checkpoint(data_dir.joinpath(model_config.path))
+
+    if is_sdxl:
+        is_v2 = False
+    else:
+        is_v2 = is_v2_motion_module(data_dir.joinpath(model_config.motion_module))
+
+    infer_config: InferenceConfig = get_infer_config(is_v2, is_sdxl)
 
     set_tensor_interpolation_method( model_config.tensor_interpolation_slerp )
 
     # set sane defaults for context, overlap, and stride if not supplied
     context, overlap, stride = get_context_params(length, context, overlap, stride)
 
-    if (not is_v2) and (context > 24):
+    if (not is_v2) and (not is_sdxl) and (context > 24):
         logger.warning( "For motion module v1, the maximum value of context is 24. Set to 24" )
         context = 24
 
     # turn the device string into a torch.device
     device: torch.device = torch.device(device)
 
+    model_name_or_path = Path("runwayml/stable-diffusion-v1-5") if not is_sdxl else Path("stabilityai/stable-diffusion-xl-base-1.0")
+
     # Get the base model if we don't have it already
     logger.info(f"Using base model: {model_name_or_path}")
-    base_model_path: Path = get_base_model(model_name_or_path, local_dir=get_dir("data/models/huggingface"))
+    base_model_path: Path = get_base_model(model_name_or_path, local_dir=get_dir("data/models/huggingface"), is_sdxl=is_sdxl)
 
     # get a timestamp for the output directory
     time_str = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
@@ -313,34 +347,47 @@ def generate(
     save_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Will save outputs to ./{path_from_cwd(save_dir)}")
 
-    controlnet_image_map, controlnet_type_map, controlnet_ref_map = controlnet_preprocess(model_config.controlnet_map, width, height, length, save_dir, device)
-    ip_adapter_map = ip_adapter_preprocess(model_config.ip_adapter_map, width, height, length, save_dir)
+    controlnet_image_map, controlnet_type_map, controlnet_ref_map, controlnet_no_shrink = controlnet_preprocess(model_config.controlnet_map, width, height, length, save_dir, device, is_sdxl)
+    img2img_map = img2img_preprocess(model_config.img2img_map, width, height, length, save_dir)
 
     # beware the pipeline
     global g_pipeline
     global last_model_path
+    pipeline_already_loaded = False
     if g_pipeline is None or last_model_path != model_config.path.resolve():
         g_pipeline = create_pipeline(
             base_model=base_model_path,
             model_config=model_config,
             infer_config=infer_config,
             use_xformers=use_xformers,
+            video_length=length,
+            is_sdxl=is_sdxl
         )
         last_model_path = model_config.path.resolve()
     else:
         logger.info("Pipeline already loaded, skipping initialization")
         # reload TIs; create_pipeline does this for us, but they may have changed
         # since load time if we're being called from another package
-        load_text_embeddings(g_pipeline)
+        #load_text_embeddings(g_pipeline, is_sdxl=is_sdxl)
+        pipeline_already_loaded = True
 
-    load_controlnet_models(pipe=g_pipeline, model_config=model_config)
+    load_controlnet_models(pipe=g_pipeline, model_config=model_config, is_sdxl=is_sdxl)
 
-    if g_pipeline.device == device:
+#    if g_pipeline.device == device:
+    if pipeline_already_loaded:
         logger.info("Pipeline already on the correct device, skipping device transfer")
     else:
+
         g_pipeline = send_to_device(
-            g_pipeline, device, freeze=True, force_half=force_half_vae, compile=model_config.compile
+            g_pipeline, device, freeze=True, force_half=force_half_vae, compile=model_config.compile, is_sdxl=is_sdxl
         )
+
+        torch.cuda.empty_cache()
+
+    apply_lcm_lora = False
+    if model_config.lcm_map:
+        if "enable" in model_config.lcm_map:
+            apply_lcm_lora = model_config.lcm_map["enable"]
 
     # save raw config to output directory
     save_config_path = save_dir.joinpath("raw_prompt.json")
@@ -352,16 +399,16 @@ def generate(
             model_config.seed[i] = get_random()
 
     # wildcard conversion
-    wild_card_dir = get_dir("wildcards")
-    for k in model_config.prompt_map.keys():
-        model_config.prompt_map[k] = replace_wild_card(model_config.prompt_map[k], wild_card_dir)
+    wild_card_conversion(model_config)
 
-    if model_config.head_prompt:
-        model_config.head_prompt = replace_wild_card(model_config.head_prompt, wild_card_dir)
-    if model_config.tail_prompt:
-        model_config.tail_prompt = replace_wild_card(model_config.tail_prompt, wild_card_dir)
+    is_init_img_exist = img2img_map != None
+    region_condi_list, region_list, ip_adapter_config_map, region2index = region_preprocess(model_config, width, height, length, save_dir, is_init_img_exist, is_sdxl)
 
-    model_config.prompt_fixed_ratio = max(min(1.0, model_config.prompt_fixed_ratio),0)
+    if controlnet_type_map:
+        for c in controlnet_type_map:
+            tmp_r = [region2index[r] for r in controlnet_type_map[c]["control_region_list"]]
+            controlnet_type_map[c]["control_region_list"] = [r for r in tmp_r if r != -1]
+            logger.info(f"{c=} / {controlnet_type_map[c]['control_region_list']}")
 
     # save config to output directory
     logger.info("Saving prompt config to output directory")
@@ -391,53 +438,39 @@ def generate(
 
             logger.info(f"Generation seed: {seed}")
 
-            prompt_map = {}
-            for k in model_config.prompt_map.keys():
-                if int(k) < length:
-                    pr = model_config.prompt_map[k]
-                    if model_config.head_prompt:
-                        pr = model_config.head_prompt + "," + pr
-                    if model_config.tail_prompt:
-                        pr = pr + "," + model_config.tail_prompt
-
-                    prompt_map[int(k)]=pr
-
-            prompt_map = dict(sorted(prompt_map.items()))
-            key_list = list(prompt_map.keys())
-#            for k0,k1 in zip(key_list,key_list[1:]+key_list[0:1]):
-            for k0,k1 in zip(key_list,key_list[1:]+[length]):
-                k05 = k0 + round((k1-k0) * model_config.prompt_fixed_ratio)
-                if k05 == k1:
-                    k05 -= 1
-                if k05 != k0:
-                    prompt_map[k05] = prompt_map[k0]
-
 
             output = run_inference(
                 pipeline=g_pipeline,
-                prompt="this is dummy string",
                 n_prompt=n_prompt,
                 seed=seed,
                 steps=model_config.steps,
                 guidance_scale=model_config.guidance_scale,
+                unet_batch_size=model_config.unet_batch_size,
                 width=width,
                 height=height,
                 duration=length,
                 idx=gen_num,
                 out_dir=save_dir,
+                context_schedule=model_config.context_schedule,
                 context_frames=context,
                 context_overlap=overlap,
                 context_stride=stride,
                 clip_skip=model_config.clip_skip,
-                prompt_map=prompt_map,
                 controlnet_map=model_config.controlnet_map,
                 controlnet_image_map=controlnet_image_map,
                 controlnet_type_map=controlnet_type_map,
                 controlnet_ref_map=controlnet_ref_map,
+                controlnet_no_shrink=controlnet_no_shrink,
                 no_frames=no_frames,
-                ip_adapter_map=ip_adapter_map,
+                img2img_map=img2img_map,
+                ip_adapter_config_map=ip_adapter_config_map,
+                region_list=region_list,
+                region_condi_list=region_condi_list,
                 output_map = model_config.output,
-                is_single_prompt_mode=model_config.is_single_prompt_mode
+                is_single_prompt_mode=model_config.is_single_prompt_mode,
+                is_sdxl=is_sdxl,
+                apply_lcm_lora=apply_lcm_lora,
+                gradual_latent_map=model_config.gradual_latent_hires_fix_map
             )
             outputs.append(output)
             torch.cuda.empty_cache()
@@ -571,7 +604,12 @@ def tile_upscale(
     config_path = config_path.absolute()
     logger.info(f"Using generation config: {path_from_cwd(config_path)}")
     model_config: ModelConfig = get_model_config(config_path)
-    infer_config: InferenceConfig = get_infer_config(is_v2_motion_module(data_dir.joinpath(model_config.motion_module)))
+
+    is_sdxl = is_sdxl_checkpoint(data_dir.joinpath(model_config.path))
+    if is_sdxl:
+        raise ValueError("Currently SDXL model is not available for this command.")
+
+    infer_config: InferenceConfig = get_infer_config(is_v2_motion_module(data_dir.joinpath(model_config.motion_module)), is_sdxl)
     frames_dir = frames_dir.absolute()
 
     set_tensor_interpolation_method( model_config.tensor_interpolation_slerp )
@@ -935,11 +973,11 @@ def refine(
             "-C",
             min=1,
             max=32,
-            help="Number of frames to condition on (default: max of <length> or 32). max for motion module v1 is 24",
+            help="Number of frames to condition on (default: 16)",
             show_default=False,
             rich_help_panel="Generation",
         ),
-    ] = None,
+    ] = 16,
     overlap: Annotated[
         Optional[int],
         typer.Option(
