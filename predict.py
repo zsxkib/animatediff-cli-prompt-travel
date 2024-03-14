@@ -42,7 +42,27 @@ FAKE_PROMPT_TRAVEL_JSON = """
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
-        pass
+        print("[!] Starting setup...")
+        print("[~] Upgrading pip...")
+        os.system("python -m pip install --upgrade pip")
+
+        # print("[~] Installing PyTorch and related packages...")
+        # os.system(
+        #     "python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121"
+        # )
+        print("[~] Installing the current package...")
+        os.system("python -m pip install -e .")
+
+        print("[~] Installing optional 'stylize' dependencies...")
+        os.system("python -m pip install -e .[stylize]")
+
+        print("[~] Installing optional 'dwpose' dependencies for controlnet_openpose...")
+        os.system("python -m pip install -e .[dwpose]")
+
+        print("[~] Installing optional 'stylize_mask' dependencies...")
+        os.system("python -m pip install -e .[stylize_mask]")
+
+        print("[!] Setup completed.")
 
     def download_custom_model(self, custom_base_model_url: str):
         # Validate the custom_base_model_url to ensure it's from "civitai.com"
@@ -214,6 +234,7 @@ class Predictor(BasePredictor):
         Run a single prediction on the model
         NOTE: lora_map, motion_lora_map, and controlnets are NOT supported (cut scope)
         """
+
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
