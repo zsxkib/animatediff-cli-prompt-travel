@@ -3,6 +3,8 @@
 
 import os
 import re
+import sys
+import time
 import subprocess
 from cog import BasePredictor, Input, Path
 
@@ -39,30 +41,82 @@ FAKE_PROMPT_TRAVEL_JSON = """
 """
 
 
+def download_weights(url, dest):
+    start = time.time()
+    try:
+        print("[!] Downloading url: ", url)
+        print("[!] Downloading to: ", dest)
+        subprocess.check_call(["pget", "-x", url, dest], close_fds=False)
+
+        # Check if the downloaded file ends up in a folder with the same name
+        if os.path.isdir(dest):
+            files = os.listdir(dest)
+            if len(files) == 1 and files[0] == os.path.basename(dest):
+                # Move the file up one level and remove the unnecessary folder
+                src_file = os.path.join(dest, files[0])
+                dst_file = dest + ".tmp"
+                os.rename(src_file, dst_file)
+                os.rmdir(dest)
+                os.rename(dst_file, dest)
+
+    except subprocess.CalledProcessError as e:
+        print(f"[!] Error downloading {url} to {dest}: {e}")
+    finally:
+        print("[!] Downloading took: ", time.time() - start)
+
+
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
         print("[!] Starting setup...")
-        print("[~] Upgrading pip...")
-        os.system("python -m pip install --upgrade pip")
 
-        # print("[~] Installing PyTorch and related packages...")
-        # os.system(
-        #     "python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121"
-        # )
         print("[~] Installing the current package...")
-        os.system("python -m pip install -e .")
+        os.system("python -m pip install -e . --no-deps")
 
         print("[~] Installing optional 'stylize' dependencies...")
-        os.system("python -m pip install -e .[stylize]")
+        os.system("python -m pip install -e .[stylize] --no-deps")
 
         print("[~] Installing optional 'dwpose' dependencies for controlnet_openpose...")
-        os.system("python -m pip install -e .[dwpose]")
+        os.system("python -m pip install -e .[dwpose] --no-deps")
 
         print("[~] Installing optional 'stylize_mask' dependencies...")
-        os.system("python -m pip install -e .[stylize_mask]")
+        os.system("python -m pip install -e .[stylize_mask] --no-deps")
 
-        print("[!] Setup completed.")
+        print("[~] Preparing to download stable-diffusion-v1-5 weights...")
+        url = "https://weights.replicate.delivery/default/animatediff-cli-prompt-travel/data/models/huggingface/stable-diffusion-v1-5.tar"
+        dir_path = "data/models/huggingface/stable-diffusion-v1-5"
+        if not os.path.exists(dir_path):
+            print("[~] Downloading stable-diffusion-v1-5 weights...")
+            download_weights(url, dir_path)
+        else:
+            print("[!] Directory for stable-diffusion-v1-5 weights already exists. Skipping download.")
+
+        # List of weight files to download and process
+        weight_files = [
+            # "mm_sd_v14.ckpt",
+            # "mm_sd_v15.ckpt",
+            "mm_sd_v15_v2.ckpt",
+        ]
+
+        # Base directory for weight files
+        base_dir = "data/models/motion-module"
+
+        # Iterate over each weight file
+        for weight_file in weight_files:
+            # Construct the directory path for the weight file
+            dir_path = os.path.join(base_dir, weight_file)
+
+            # Check if the weight file exists at the specified directory path
+            print(f"[~] Checking if {weight_file} exists at {dir_path}...")
+            if os.path.exists(dir_path):
+                print(f"[!] {weight_file} exists, skipping download...")
+            else:
+                print(f"[~] {weight_file} does not exist, downloading now...")
+                # Download the weight file from Google Cloud Storage
+                url = f"https://weights.replicate.delivery/default/animatediff-cli-prompt-travel/data/models/motion-module/{weight_file}.tar"
+                download_weights(url, dir_path)
+
+        print("[!] Setup completed.\n")
 
     def download_custom_model(self, custom_base_model_url: str):
         # Validate the custom_base_model_url to ensure it's from "civitai.com"
@@ -71,18 +125,20 @@ class Predictor(BasePredictor):
                 "Invalid URL. Only downloads from 'https://civitai.com/api/download/models/' are allowed."
             )
 
-        cmd = ["wget", "-O", "data/share/Stable-diffusion/custom.safetensors", custom_base_model_url]
+        cmd = ["wget", "-O", "data/models/sd/custom.safetensors", custom_base_model_url]
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout_output, stderr_output = process.communicate()
 
-        print("Output from wget command:")
+        print("[!] Output from wget command:")
         print(stdout_output)
         if stderr_output:
-            print("Errors from wget command:")
+            print("[!] Errors from wget command:")
             print(stderr_output)
 
         if process.returncode:
-            raise ValueError(f"Failed to download the custom model. Wget returned code: {process.returncode}")
+            raise ValueError(
+                f"[!] Failed to download the custom model. Wget returned code: {process.returncode}"
+            )
         return "custom"
 
     def transform_prompt_map(self, prompt_map_string: str):
@@ -113,6 +169,103 @@ class Predictor(BasePredictor):
             formatted_segments.append(formatted_segment)
 
         return ", ".join(formatted_segments)
+
+    def generate_prompt_travel_json(
+        self,
+        base_model,
+        output_format,
+        seed,
+        steps,
+        guidance_scale,
+        prompt_fixed_ratio,
+        head_prompt,
+        tail_prompt,
+        negative_prompt,
+        playback_frames_per_second,
+        prompt_map,
+        scheduler,
+        clip_skip,
+    ):
+        return FAKE_PROMPT_TRAVEL_JSON.format(
+            dreambooth_path=f"models/sd/{base_model}.safetensors",
+            output_format=output_format,
+            seed=seed,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            prompt_fixed_ratio=prompt_fixed_ratio,
+            head_prompt=head_prompt,
+            tail_prompt=tail_prompt,
+            negative_prompt=negative_prompt,
+            playback_frames_per_second=playback_frames_per_second,
+            prompt_map=self.transform_prompt_map(prompt_map),
+            scheduler=scheduler,
+            clip_skip=clip_skip,
+        )
+
+    def save_prompt_travel_json(self, prompt_travel_json):
+        file_path = "config/prompts/custom_prompt_travel.json"
+        directory = os.path.dirname(file_path)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        with open(file_path, "w") as file:
+            file.write(prompt_travel_json)
+
+    def run_animatediff_command(self, width, height, frames, context):
+        cmd = [
+            "animatediff",
+            "generate",
+            "-c",
+            "config/prompts/custom_prompt_travel.json",
+            "-W",
+            str(width),
+            "-H",
+            str(height),
+            "-L",
+            str(frames),
+            "-C",
+            str(context),
+        ]
+        print(f"[!] Running command: {' '.join(cmd)}")
+
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        for line in process.stdout:
+            print(line, end="")
+            sys.stdout.flush()
+
+        _, stderr_output = process.communicate()
+
+        if stderr_output:
+            print(f"[!] Error: {stderr_output}")
+
+        if process.returncode:
+            raise ValueError(f"Command exited with code: {process.returncode}")
+
+        recent_dir = self.find_recent_output_directory()
+        media_path = self.find_media_file(recent_dir)
+
+        return media_path
+
+    def find_recent_output_directory(self):
+        print("[~] Identifying the output directory from the generated outputs...")
+        recent_dir = max(
+            (
+                os.path.join("output", d)
+                for d in os.listdir("output")
+                if os.path.isdir(os.path.join("output", d))
+            ),
+            key=os.path.getmtime,
+        )
+        print(f"[!] Identified directory: {recent_dir}")
+        return recent_dir
+
+    def find_media_file(self, directory):
+        media_files = [f for f in os.listdir(directory) if f.endswith((".gif", ".mp4"))]
+        if not media_files:
+            raise ValueError(f"No GIF or MP4 files found in directory: {directory}")
+        media_path = os.path.join(directory, media_files[0])
+        print(f"[!] Identified Media Path: {media_path}")
+        return media_path
 
     def predict(
         self,
@@ -234,15 +387,30 @@ class Predictor(BasePredictor):
         Run a single prediction on the model
         NOTE: lora_map, motion_lora_map, and controlnets are NOT supported (cut scope)
         """
+        start_time = time.time()
+
+        base_model_map = {
+            "realisticVisionV20_v20": "realisticVisionV40_v20Novae.safetensors",
+            "lyriel_v16": "lyriel_v16.safetensors",
+            "majicmixRealistic_v5Preview": "majicmixRealistic_v5Preview.safetensors",
+            "rcnzCartoon3d_v10": "rcnzCartoon3d_v10.safetensors",
+            "toonyou_beta3": "toonyou_beta3.safetensors",
+        }
+
+        if base_model != "CUSTOM":
+            base_model_file = base_model_map[base_model]
+            base_model_path = f"data/models/sd/{base_model_file}"
+            if not os.path.exists(base_model_path):
+                url = f"https://weights.replicate.delivery/default/animatediff-cli-prompt-travel/data/models/sd/{base_model_file}.tar"
+                download_weights(url, base_model_path)
+        else:
+            base_model = self.download_custom_model(custom_base_model_url)
 
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
-        if base_model.upper() == "CUSTOM":
-            base_model = self.download_custom_model(custom_base_model_url)
-
-        prompt_travel_json = FAKE_PROMPT_TRAVEL_JSON.format(
-            dreambooth_path=f"share/Stable-diffusion/{base_model}.safetensors",
+        prompt_travel_json = self.generate_prompt_travel_json(
+            base_model=base_model,
             output_format=output_format,
             seed=seed,
             steps=steps,
@@ -252,67 +420,21 @@ class Predictor(BasePredictor):
             tail_prompt=tail_prompt,
             negative_prompt=negative_prompt,
             playback_frames_per_second=playback_frames_per_second,
-            prompt_map=self.transform_prompt_map(prompt_map),
+            prompt_map=prompt_map,
             scheduler=scheduler,
             clip_skip=clip_skip,
         )
 
-        print(f"{'-'*80}")
-        print(prompt_travel_json)
-        print(f"{'-'*80}")
+        self.save_prompt_travel_json(prompt_travel_json)
 
-        file_path = "config/prompts/custom_prompt_travel.json"
-        directory = os.path.dirname(file_path)
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-        with open(file_path, "w") as file:
-            file.write(prompt_travel_json)
-
-        cmd = [
-            "animatediff",
-            "generate",
-            "-c",
-            str(file_path),
-            "-W",
-            str(width),
-            "-H",
-            str(height),
-            "-L",
-            str(frames),
-            "-C",
-            str(context),
-        ]
-        print(f"Running command: {' '.join(cmd)}")
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        (
-            stdout_output,
-            stderr_output,
-        ) = process.communicate()
-
-        print(stdout_output)
-        if stderr_output:
-            print(f"Error: {stderr_output}")
-
-        if process.returncode:
-            raise ValueError(f"Command exited with code: {process.returncode}")
-
-        print("Identifying the GIF path from the generated outputs...")
-        recent_dir = max(
-            (
-                os.path.join("output", d)
-                for d in os.listdir("output")
-                if os.path.isdir(os.path.join("output", d))
-            ),
-            key=os.path.getmtime,
+        media_path = self.run_animatediff_command(
+            width=width,
+            height=height,
+            frames=frames,
+            context=context,
         )
 
-        print(f"Identified directory: {recent_dir}")
-        media_files = [f for f in os.listdir(recent_dir) if f.endswith((".gif", ".mp4"))]
-
-        if not media_files:
-            raise ValueError(f"No GIF or MP4 files found in directory: {recent_dir}")
-
-        media_path = os.path.join(recent_dir, media_files[0])
-        print(f"Identified Media Path: {media_path}")
+        end_time = time.time()
+        print(f"[!] Prediction took: {end_time - start_time} seconds")
 
         return Path(media_path)
